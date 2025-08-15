@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-Standalone Network PCAP Analysis Module
-Extracted and consolidated from CAPEv2 for analyzing tcpdump network packets
+Enhanced Network PCAP Analysis Module with Malware Detection
+Extracted and enhanced from CAPEv2 for analyzing tcpdump network packets
 
-This module contains all necessary dependencies consolidated into a single file
-for easy portability to other projects.
+This module combines PCAP analysis with advanced malware detection capabilities,
+all consolidated into a single file for easy portability to other projects.
+
+Features:
+- Comprehensive PCAP analysis (HTTP, DNS, TCP/UDP, ICMP, IRC, TLS)
+- Advanced malware detection and behavioral analysis
+- Network-based threat intelligence and IOC detection
+- C2 communication pattern detection
+- DNS tunneling and protocol anomaly detection
+- Malware family identification via network signatures
+- Threat scoring and risk assessment
 
 Usage:
     from network_all import PcapAnalyzer
@@ -15,7 +24,8 @@ Usage:
     # Access results
     print("HTTP requests:", results['http'])
     print("DNS requests:", results['dns'])
-    print("Hosts:", results['hosts'])
+    print("Malware detections:", results['malware_analysis'])
+    print("Threat intelligence:", results['threat_intelligence'])
 """
 
 import binascii
@@ -28,14 +38,16 @@ import struct
 import sys
 import tempfile
 import hashlib
-from base64 import b64encode
-from collections import OrderedDict, namedtuple
+import time
+from base64 import b64encode, b64decode
+from collections import OrderedDict, namedtuple, defaultdict
 from contextlib import suppress
 from hashlib import md5, sha1, sha256
 from itertools import islice
 from json import loads
-from urllib.parse import urlunparse
+from urllib.parse import urlunparse, urlparse
 from pathlib import Path
+from datetime import datetime, timedelta
 
 # Optional dependencies with fallbacks
 try:
@@ -142,7 +154,513 @@ def get_file_sha256(filepath):
 
 
 # ============================================================================
-# Domain and IP filtering (simplified from CAPEv2 safelist)
+# Malware Detection and Threat Intelligence
+# ============================================================================
+
+# Known malware families and their network indicators
+MALWARE_FAMILIES = {
+    "CobaltStrike": {
+        "user_agents": [
+            "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; Trident/4.0)",
+            "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko"
+        ],
+        "uri_patterns": [
+            r"/.*\.php\?[a-z]{2,8}=[0-9a-f]{8,32}",
+            r"/.*\/[a-zA-Z0-9]{1,16}$",
+            r"/__utm\.gif\?.*"
+        ],
+        "http_methods": ["GET", "POST"],
+        "beaconing_patterns": {
+            "interval_range": (30, 600),  # seconds
+            "jitter_tolerance": 0.3
+        }
+    },
+    "Emotet": {
+        "user_agents": [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        ],
+        "uri_patterns": [
+            r"/[a-zA-Z0-9]{8,16}/$",
+            r"/wp-admin/.*",
+            r"/wp-content/.*"
+        ],
+        "domains": [
+            r".*\.top$",
+            r".*\.tk$"
+        ]
+    },
+    "TrickBot": {
+        "uri_patterns": [
+            r"/[0-9]{8,10}/[0-9a-f]{32}",
+            r"/.*\.avi$"
+        ],
+        "user_agents": [
+            "WinHTTP Example/1.0"
+        ]
+    },
+    "QakBot": {
+        "uri_patterns": [
+            r"/[0-9]{1,8}$",
+            r"/[0-9a-f]{8}\.dat$"
+        ]
+    }
+}
+
+# Known malicious domains and IPs (simplified threat intelligence)
+THREAT_INTELLIGENCE = {
+    "malicious_domains": [
+        # Known malware C2 domains (examples)
+        "malware-traffic-analysis.net",
+        "checkip.dyndns.org",
+        "ipinfo.io",
+        # Add more as needed
+    ],
+    "malicious_ips": [
+        # Known malicious IPs (examples)
+        "185.159.158.0/24",
+        "195.123.245.0/24",
+        # Add more as needed
+    ],
+    "suspicious_tlds": [
+        ".tk", ".ml", ".ga", ".cf", ".onion", ".bit"
+    ],
+    "c2_patterns": [
+        r".*\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}.*",  # IP-like patterns in domains
+        r".*[0-9a-f]{32,64}.*",  # Hash-like patterns
+        r".*\.(php|asp|jsp)\?.*=[0-9a-f]{8,}.*"  # Suspicious query patterns
+    ]
+}
+
+# DNS tunneling detection patterns
+DNS_TUNNELING_INDICATORS = {
+    "suspicious_query_types": ["TXT", "MX", "CNAME", "NULL"],
+    "query_length_threshold": 50,  # Unusually long DNS queries
+    "subdomain_count_threshold": 4,  # Too many subdomains
+    "entropy_threshold": 3.5,  # High entropy in queries suggests encoding
+    "base64_patterns": [
+        r"^[A-Za-z0-9+/]+=*$",  # Base64 encoded data
+        r"^[A-Za-z0-9_-]+=*$"   # Base64 URL-safe
+    ]
+}
+
+
+class ThreatIntelligence:
+    """Threat intelligence and IOC detection"""
+    
+    def __init__(self):
+        self.malicious_domains = set(THREAT_INTELLIGENCE["malicious_domains"])
+        self.malicious_ips = THREAT_INTELLIGENCE["malicious_ips"]
+        self.suspicious_tlds = THREAT_INTELLIGENCE["suspicious_tlds"]
+        self.c2_patterns = [re.compile(pattern) for pattern in THREAT_INTELLIGENCE["c2_patterns"]]
+    
+    def is_malicious_domain(self, domain):
+        """Check if domain is known malicious"""
+        if domain.lower() in self.malicious_domains:
+            return True
+        
+        # Check TLD
+        for tld in self.suspicious_tlds:
+            if domain.lower().endswith(tld):
+                return True
+        
+        # Check patterns
+        for pattern in self.c2_patterns:
+            if pattern.search(domain):
+                return True
+        
+        return False
+    
+    def is_malicious_ip(self, ip):
+        """Check if IP is in malicious ranges"""
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            for cidr in self.malicious_ips:
+                if ip_obj in ipaddress.ip_network(cidr):
+                    return True
+        except:
+            pass
+        return False
+    
+    def calculate_domain_entropy(self, domain):
+        """Calculate Shannon entropy of domain name"""
+        import math
+        
+        if not domain:
+            return 0
+        
+        # Remove common TLD for calculation
+        domain_without_tld = domain.split('.')[0]
+        
+        entropy = 0.0
+        length = len(domain_without_tld)
+        
+        if length <= 1:
+            return 0
+        
+        # Count character frequencies
+        char_counts = {}
+        for char in domain_without_tld:
+            char_counts[char] = char_counts.get(char, 0) + 1
+        
+        # Calculate entropy
+        for count in char_counts.values():
+            probability = count / length
+            entropy -= probability * math.log2(probability)
+        
+        return entropy
+
+
+class MalwareDetector:
+    """Advanced malware detection and behavioral analysis"""
+    
+    def __init__(self):
+        self.threat_intel = ThreatIntelligence()
+        self.detections = []
+        self.suspicious_activities = []
+        self.beaconing_candidates = defaultdict(list)
+        self.dns_tunneling_indicators = []
+        self.http_anomalies = []
+    
+    def analyze_http_request(self, http_request):
+        """Analyze HTTP request for malware indicators"""
+        detections = []
+        
+        # Check user agent patterns
+        user_agent = http_request.get("user_agent", "")
+        for family, indicators in MALWARE_FAMILIES.items():
+            if "user_agents" in indicators:
+                for ua_pattern in indicators["user_agents"]:
+                    if ua_pattern in user_agent:
+                        detections.append({
+                            "type": "malware_family",
+                            "family": family,
+                            "indicator": "user_agent",
+                            "value": user_agent,
+                            "severity": "high",
+                            "description": f"User agent matches {family} malware pattern"
+                        })
+        
+        # Check URI patterns
+        uri = http_request.get("uri", "")
+        for family, indicators in MALWARE_FAMILIES.items():
+            if "uri_patterns" in indicators:
+                for uri_pattern in indicators["uri_patterns"]:
+                    if re.search(uri_pattern, uri):
+                        detections.append({
+                            "type": "malware_family",
+                            "family": family,
+                            "indicator": "uri_pattern",
+                            "value": uri,
+                            "severity": "high",
+                            "description": f"URI matches {family} malware pattern"
+                        })
+        
+        # Check host for threats
+        host = http_request.get("host", "")
+        if host and self.threat_intel.is_malicious_domain(host):
+            detections.append({
+                "type": "threat_intelligence",
+                "indicator": "malicious_domain",
+                "value": host,
+                "severity": "critical",
+                "description": "Communication with known malicious domain"
+            })
+        
+        # Check for suspicious HTTP characteristics
+        if len(uri) > 200:
+            detections.append({
+                "type": "behavioral",
+                "indicator": "long_uri",
+                "value": uri,
+                "severity": "medium",
+                "description": "Unusually long URI may indicate data exfiltration"
+            })
+        
+        # Check for base64 encoded data in URI
+        if re.search(r"[A-Za-z0-9+/]{20,}={0,2}", uri):
+            detections.append({
+                "type": "behavioral",
+                "indicator": "base64_uri",
+                "value": uri,
+                "severity": "medium",
+                "description": "Base64 encoded data in URI"
+            })
+        
+        return detections
+    
+    def analyze_dns_request(self, dns_request):
+        """Analyze DNS request for tunneling and malicious domains"""
+        detections = []
+        
+        domain = dns_request.get("request", "")
+        if not domain:
+            return detections
+        
+        # Check against threat intelligence
+        if self.threat_intel.is_malicious_domain(domain):
+            detections.append({
+                "type": "threat_intelligence",
+                "indicator": "malicious_domain",
+                "value": domain,
+                "severity": "critical",
+                "description": "DNS query to known malicious domain"
+            })
+        
+        # DNS tunneling detection
+        # Check query length
+        if len(domain) > DNS_TUNNELING_INDICATORS["query_length_threshold"]:
+            detections.append({
+                "type": "dns_tunneling",
+                "indicator": "long_query",
+                "value": domain,
+                "severity": "medium",
+                "description": "Unusually long DNS query may indicate tunneling"
+            })
+        
+        # Check subdomain count
+        subdomain_count = len(domain.split('.')) - 2  # Exclude domain and TLD
+        if subdomain_count > DNS_TUNNELING_INDICATORS["subdomain_count_threshold"]:
+            detections.append({
+                "type": "dns_tunneling",
+                "indicator": "many_subdomains",
+                "value": domain,
+                "severity": "medium",
+                "description": "Too many subdomains may indicate DNS tunneling"
+            })
+        
+        # Check entropy
+        entropy = self.threat_intel.calculate_domain_entropy(domain)
+        if entropy > DNS_TUNNELING_INDICATORS["entropy_threshold"]:
+            detections.append({
+                "type": "dns_tunneling",
+                "indicator": "high_entropy",
+                "value": domain,
+                "severity": "medium",
+                "description": f"High entropy ({entropy:.2f}) suggests encoded data"
+            })
+        
+        # Check for base64 patterns
+        for pattern in DNS_TUNNELING_INDICATORS["base64_patterns"]:
+            subdomain = domain.split('.')[0]
+            if re.match(pattern, subdomain) and len(subdomain) > 10:
+                detections.append({
+                    "type": "dns_tunneling",
+                    "indicator": "base64_encoding",
+                    "value": domain,
+                    "severity": "high",
+                    "description": "Base64 encoded data in DNS query"
+                })
+        
+        # Check query type
+        query_type = dns_request.get("type", "")
+        if query_type in DNS_TUNNELING_INDICATORS["suspicious_query_types"]:
+            detections.append({
+                "type": "dns_tunneling",
+                "indicator": "suspicious_query_type",
+                "value": f"{domain} ({query_type})",
+                "severity": "low",
+                "description": f"Suspicious DNS query type: {query_type}"
+            })
+        
+        return detections
+    
+    def analyze_connection_patterns(self, connections):
+        """Analyze connection patterns for beaconing and other suspicious behavior"""
+        detections = []
+        
+        # Group connections by destination
+        dest_connections = defaultdict(list)
+        for conn in connections:
+            key = (conn.get("dst"), conn.get("dport"))
+            dest_connections[key].append(conn)
+        
+        # Analyze each destination for beaconing
+        for (dst_ip, dst_port), conns in dest_connections.items():
+            if len(conns) >= 3:  # Need multiple connections to detect beaconing
+                # Sort by timestamp
+                sorted_conns = sorted(conns, key=lambda x: x.get("time", 0))
+                
+                # Calculate intervals
+                intervals = []
+                for i in range(1, len(sorted_conns)):
+                    interval = sorted_conns[i]["time"] - sorted_conns[i-1]["time"]
+                    intervals.append(interval)
+                
+                if intervals:
+                    # Calculate beaconing metrics
+                    avg_interval = sum(intervals) / len(intervals)
+                    variance = sum((x - avg_interval) ** 2 for x in intervals) / len(intervals)
+                    std_dev = variance ** 0.5
+                    
+                    # Check for regular beaconing (low variance)
+                    coefficient_of_variation = std_dev / avg_interval if avg_interval > 0 else 0
+                    
+                    if coefficient_of_variation < 0.3 and len(conns) >= 5:
+                        detections.append({
+                            "type": "behavioral",
+                            "indicator": "beaconing",
+                            "value": f"{dst_ip}:{dst_port}",
+                            "severity": "high",
+                            "description": f"Regular beaconing detected (avg interval: {avg_interval:.1f}s, {len(conns)} connections)"
+                        })
+        
+        # Check for port scanning
+        src_connections = defaultdict(set)
+        for conn in connections:
+            src_ip = conn.get("src")
+            dst_port = conn.get("dport")
+            if src_ip and dst_port:
+                src_connections[src_ip].add(dst_port)
+        
+        for src_ip, ports in src_connections.items():
+            if len(ports) > 10:  # Scanning many ports
+                detections.append({
+                    "type": "behavioral",
+                    "indicator": "port_scanning",
+                    "value": src_ip,
+                    "severity": "medium",
+                    "description": f"Port scanning detected: {len(ports)} different ports"
+                })
+        
+        return detections
+    
+    def analyze_protocol_anomalies(self, http_requests, dns_requests):
+        """Analyze protocol usage for anomalies"""
+        detections = []
+        
+        # Check for HTTP on non-standard ports
+        for http_req in http_requests:
+            port = http_req.get("dport", 80)
+            if port not in [80, 443, 8080, 8443]:
+                detections.append({
+                    "type": "behavioral",
+                    "indicator": "http_nonstandard_port",
+                    "value": f"Port {port}",
+                    "severity": "medium",
+                    "description": f"HTTP traffic on non-standard port {port}"
+                })
+        
+        # Check for excessive DNS queries to same domain
+        domain_counts = defaultdict(int)
+        for dns_req in dns_requests:
+            domain = dns_req.get("request", "")
+            if domain:
+                domain_counts[domain] += 1
+        
+        for domain, count in domain_counts.items():
+            if count > 50:  # Excessive queries
+                detections.append({
+                    "type": "behavioral",
+                    "indicator": "excessive_dns_queries",
+                    "value": domain,
+                    "severity": "medium",
+                    "description": f"Excessive DNS queries to {domain} ({count} queries)"
+                })
+        
+        return detections
+    
+    def generate_threat_score(self, detections):
+        """Generate overall threat score based on detections"""
+        score = 0
+        
+        severity_weights = {
+            "critical": 10,
+            "high": 7,
+            "medium": 4,
+            "low": 1
+        }
+        
+        for detection in detections:
+            severity = detection.get("severity", "low")
+            score += severity_weights.get(severity, 1)
+        
+        # Normalize to 0-100 scale
+        max_possible = len(detections) * 10
+        if max_possible > 0:
+            normalized_score = min(100, (score / max_possible) * 100)
+        else:
+            normalized_score = 0
+        
+        return {
+            "raw_score": score,
+            "normalized_score": normalized_score,
+            "risk_level": self._get_risk_level(normalized_score),
+            "detection_count": len(detections)
+        }
+    
+    def _get_risk_level(self, score):
+        """Convert threat score to risk level"""
+        if score >= 70:
+            return "CRITICAL"
+        elif score >= 50:
+            return "HIGH"
+        elif score >= 30:
+            return "MEDIUM"
+        elif score >= 10:
+            return "LOW"
+        else:
+            return "MINIMAL"
+    
+    def analyze_all(self, pcap_results):
+        """Perform comprehensive malware analysis on PCAP results"""
+        all_detections = []
+        
+        # Analyze HTTP requests
+        for http_req in pcap_results.get("http", []):
+            detections = self.analyze_http_request(http_req)
+            all_detections.extend(detections)
+        
+        # Analyze DNS requests
+        for dns_req in pcap_results.get("dns", []):
+            detections = self.analyze_dns_request(dns_req)
+            all_detections.extend(detections)
+        
+        # Analyze connection patterns
+        tcp_connections = pcap_results.get("tcp", [])
+        udp_connections = pcap_results.get("udp", [])
+        all_connections = tcp_connections + udp_connections
+        
+        pattern_detections = self.analyze_connection_patterns(all_connections)
+        all_detections.extend(pattern_detections)
+        
+        # Analyze protocol anomalies
+        anomaly_detections = self.analyze_protocol_anomalies(
+            pcap_results.get("http", []),
+            pcap_results.get("dns", [])
+        )
+        all_detections.extend(anomaly_detections)
+        
+        # Generate threat score
+        threat_score = self.generate_threat_score(all_detections)
+        
+        # Group detections by type
+        detections_by_type = defaultdict(list)
+        families_detected = set()
+        
+        for detection in all_detections:
+            detection_type = detection.get("type", "unknown")
+            detections_by_type[detection_type].append(detection)
+            
+            if detection_type == "malware_family":
+                families_detected.add(detection.get("family"))
+        
+        return {
+            "threat_score": threat_score,
+            "malware_families": list(families_detected),
+            "detections": all_detections,
+            "detections_by_type": dict(detections_by_type),
+            "detection_summary": {
+                "total_detections": len(all_detections),
+                "critical_detections": len([d for d in all_detections if d.get("severity") == "critical"]),
+                "high_detections": len([d for d in all_detections if d.get("severity") == "high"]),
+                "medium_detections": len([d for d in all_detections if d.get("severity") == "medium"]),
+                "low_detections": len([d for d in all_detections if d.get("severity") == "low"])
+            }
+        }
+
+
+# ============================================================================
+# Domain and IP filtering (enhanced with threat intelligence)
 # ============================================================================
 
 # Basic domain patterns that are commonly safelisted
@@ -289,6 +807,7 @@ class PcapAnalyzer:
                 - safelist_dns: Enable DNS safelisting (default: False)
                 - allowed_dns: Comma-separated list of allowed DNS servers
                 - maxmind_db_path: Path to MaxMind GeoIP database
+                - enable_malware_detection: Enable malware analysis (default: True)
         """
         self.filepath = filepath
         self.options = options or {}
@@ -315,6 +834,7 @@ class PcapAnalyzer:
         self.safelist_enabled = self.options.get("safelist_dns", False)
         self.resolve_dns = self.options.get("resolve_dns", False)
         self.country_lookup = self.options.get("country_lookup", False)
+        self.enable_malware_detection = self.options.get("enable_malware_detection", True)
         
         # DNS servers
         self.known_dns = self._build_known_dns()
@@ -324,6 +844,9 @@ class PcapAnalyzer:
         self.tcp_connections_dead = {}
         self.dead_hosts = {}
         self.alive_hosts = {}
+        
+        # Malware detection
+        self.malware_detector = MalwareDetector() if self.enable_malware_detection else None
         
         # GeoIP database
         self._maxmind_client = None
@@ -787,6 +1310,8 @@ class PcapAnalyzer:
         # Build results
         self.results = {
             "pcap_sha256": get_file_sha256(self.filepath),
+            "analysis_timestamp": datetime.now().isoformat(),
+            "analyzer_version": "2.0",
             "hosts": self._enrich_hosts(self.unique_hosts),
             "domains": self.unique_domains,
             "tcp": [conn_from_flowtuple(conn) for conn in self.tcp_connections],
@@ -804,6 +1329,23 @@ class PcapAnalyzer:
             if count >= 3 and (ip, port) not in self.alive_hosts:
                 self.results["dead_hosts"].append({"ip": ip, "port": port, "attempts": count})
         
+        # Perform malware analysis if enabled
+        if self.enable_malware_detection and self.malware_detector:
+            log.info("Performing malware analysis...")
+            malware_analysis = self.malware_detector.analyze_all(self.results)
+            self.results["malware_analysis"] = malware_analysis
+            
+            # Add threat intelligence summary
+            threat_intel_summary = self._generate_threat_intel_summary()
+            self.results["threat_intelligence"] = threat_intel_summary
+            
+            log.info("Malware analysis complete. Threat score: %.1f (%s)", 
+                    malware_analysis["threat_score"]["normalized_score"],
+                    malware_analysis["threat_score"]["risk_level"])
+        else:
+            self.results["malware_analysis"] = {"enabled": False}
+            self.results["threat_intelligence"] = {"enabled": False}
+        
         log.info("Analysis complete. Found:")
         log.info("  - %d unique hosts", len(self.results["hosts"]))
         log.info("  - %d unique domains", len(self.results["domains"]))
@@ -814,7 +1356,48 @@ class PcapAnalyzer:
         log.info("  - %d IRC messages", len(self.results["irc"]))
         log.info("  - %d ICMP requests", len(self.results["icmp"]))
         
+        if self.enable_malware_detection:
+            malware_results = self.results.get("malware_analysis", {})
+            detection_count = malware_results.get("detection_summary", {}).get("total_detections", 0)
+            log.info("  - %d malware detections", detection_count)
+        
         return self.results
+    
+    def _generate_threat_intel_summary(self):
+        """Generate threat intelligence summary"""
+        summary = {
+            "malicious_domains_contacted": [],
+            "malicious_ips_contacted": [],
+            "suspicious_activities": [],
+            "iocs": []  # Indicators of Compromise
+        }
+        
+        # Check hosts for malicious IPs
+        for host_info in self.results.get("hosts", []):
+            ip = host_info.get("ip")
+            if ip and self.malware_detector.threat_intel.is_malicious_ip(ip):
+                summary["malicious_ips_contacted"].append({
+                    "ip": ip,
+                    "hostname": host_info.get("hostname", ""),
+                    "country": host_info.get("country_name", "")
+                })
+        
+        # Check domains for malicious ones
+        for domain in self.results.get("domains", []):
+            if self.malware_detector.threat_intel.is_malicious_domain(domain):
+                summary["malicious_domains_contacted"].append(domain)
+        
+        # Extract IOCs from detections
+        for detection in self.results.get("malware_analysis", {}).get("detections", []):
+            ioc = {
+                "type": detection.get("indicator", "unknown"),
+                "value": detection.get("value", ""),
+                "severity": detection.get("severity", "low"),
+                "description": detection.get("description", "")
+            }
+            summary["iocs"].append(ioc)
+        
+        return summary
 
 
 # ============================================================================
@@ -930,7 +1513,7 @@ def main():
     import argparse
     import json
     
-    parser = argparse.ArgumentParser(description="Standalone Network PCAP Analyzer")
+    parser = argparse.ArgumentParser(description="Enhanced Network PCAP Analyzer with Malware Detection")
     parser.add_argument("pcap_file", help="Path to PCAP file to analyze")
     parser.add_argument("-o", "--output", help="Output JSON file (default: stdout)")
     parser.add_argument("--resolve-dns", action="store_true", help="Enable DNS resolution")
@@ -939,7 +1522,11 @@ def main():
     parser.add_argument("--safelist-dns", action="store_true", help="Enable DNS safelisting")
     parser.add_argument("--allowed-dns", help="Comma-separated list of allowed DNS servers")
     parser.add_argument("--sort-pcap", help="Sort PCAP and save to this path")
+    parser.add_argument("--disable-malware-detection", action="store_true", 
+                       help="Disable malware detection and behavioral analysis")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    parser.add_argument("--threat-only", action="store_true", 
+                       help="Show only malware detections and threat intelligence")
     
     args = parser.parse_args()
     
@@ -952,7 +1539,8 @@ def main():
         "country_lookup": args.country_lookup,
         "safelist_dns": args.safelist_dns,
         "allowed_dns": args.allowed_dns,
-        "maxmind_db_path": args.maxmind_db
+        "maxmind_db_path": args.maxmind_db,
+        "enable_malware_detection": not args.disable_malware_detection
     }
     
     # Analyze PCAP
@@ -965,13 +1553,107 @@ def main():
         sort_pcap(args.pcap_file, args.sort_pcap)
         log.info("PCAP sorted successfully")
     
+    # Filter results if threat-only mode
+    if args.threat_only:
+        threat_results = {
+            "pcap_sha256": results.get("pcap_sha256"),
+            "analysis_timestamp": results.get("analysis_timestamp"),
+            "malware_analysis": results.get("malware_analysis"),
+            "threat_intelligence": results.get("threat_intelligence")
+        }
+        results = threat_results
+    
     # Output results
     if args.output:
         with open(args.output, 'w') as f:
             json.dump(results, f, indent=2, default=str)
         log.info("Results saved to %s", args.output)
+        
+        # Print summary to console
+        if not args.threat_only:
+            _print_analysis_summary(results)
+        _print_threat_summary(results)
     else:
         print(json.dumps(results, indent=2, default=str))
+
+
+def _print_analysis_summary(results):
+    """Print analysis summary to console"""
+    print("\n" + "="*60)
+    print("NETWORK ANALYSIS SUMMARY")
+    print("="*60)
+    print(f"Hosts discovered: {len(results.get('hosts', []))}")
+    print(f"Domains discovered: {len(results.get('domains', []))}")
+    print(f"TCP connections: {len(results.get('tcp', []))}")
+    print(f"UDP connections: {len(results.get('udp', []))}")
+    print(f"HTTP requests: {len(results.get('http', []))}")
+    print(f"DNS requests: {len(results.get('dns', []))}")
+
+
+def _print_threat_summary(results):
+    """Print threat analysis summary to console"""
+    malware_analysis = results.get("malware_analysis", {})
+    if not malware_analysis or not malware_analysis.get("enabled", True):
+        print("\nMalware detection was disabled.")
+        return
+    
+    print("\n" + "="*60)
+    print("MALWARE ANALYSIS SUMMARY")
+    print("="*60)
+    
+    threat_score = malware_analysis.get("threat_score", {})
+    print(f"Threat Score: {threat_score.get('normalized_score', 0):.1f}/100")
+    print(f"Risk Level: {threat_score.get('risk_level', 'UNKNOWN')}")
+    
+    detection_summary = malware_analysis.get("detection_summary", {})
+    total_detections = detection_summary.get("total_detections", 0)
+    print(f"Total Detections: {total_detections}")
+    
+    if total_detections > 0:
+        print(f"  - Critical: {detection_summary.get('critical_detections', 0)}")
+        print(f"  - High: {detection_summary.get('high_detections', 0)}")
+        print(f"  - Medium: {detection_summary.get('medium_detections', 0)}")
+        print(f"  - Low: {detection_summary.get('low_detections', 0)}")
+    
+    families = malware_analysis.get("malware_families", [])
+    if families:
+        print(f"Malware Families Detected: {', '.join(families)}")
+    
+    # Show top detections
+    detections = malware_analysis.get("detections", [])
+    if detections:
+        print(f"\nTop 5 Detections:")
+        # Sort by severity
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        sorted_detections = sorted(detections, 
+                                 key=lambda x: severity_order.get(x.get("severity", "low"), 3))
+        
+        for i, detection in enumerate(sorted_detections[:5], 1):
+            severity = detection.get("severity", "").upper()
+            desc = detection.get("description", "")
+            value = detection.get("value", "")
+            print(f"  {i}. [{severity}] {desc}")
+            if value and len(str(value)) < 100:
+                print(f"     Value: {value}")
+    
+    # Threat intelligence summary
+    threat_intel = results.get("threat_intelligence", {})
+    if threat_intel and threat_intel.get("enabled", True):
+        malicious_domains = threat_intel.get("malicious_domains_contacted", [])
+        malicious_ips = threat_intel.get("malicious_ips_contacted", [])
+        
+        if malicious_domains or malicious_ips:
+            print(f"\nThreat Intelligence Matches:")
+            if malicious_domains:
+                print(f"  Malicious domains contacted: {len(malicious_domains)}")
+                for domain in malicious_domains[:3]:
+                    print(f"    - {domain}")
+            if malicious_ips:
+                print(f"  Malicious IPs contacted: {len(malicious_ips)}")
+                for ip_info in malicious_ips[:3]:
+                    print(f"    - {ip_info.get('ip')} ({ip_info.get('country', 'unknown')})")
+    
+    print("="*60)
 
 
 if __name__ == "__main__":
